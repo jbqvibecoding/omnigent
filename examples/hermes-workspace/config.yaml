@@ -1,0 +1,144 @@
+spec_version: 1
+name: hermes_workspace
+description: >-
+  A Hermes-brained workspace orchestrator: decomposes a goal into workspace
+  tasks (research / author / build / review) and delegates each to the best
+  sub-agent. Unlike polly, the deliverable is a workspace artifact (report,
+  document, deck, dataset, or code change) — not necessarily a PR. Draft
+  derived from examples/polly/; see designs/hermes-workspace-blueprint.md.
+
+# Beyond the declared sub-agents below, the orchestrator may spawn child
+# sessions it defines itself (sys_session_create), e.g. a one-off worker with
+# a task-specific skill bundle.
+spawn: true
+
+# Orchestrator "brain": the Hermes Agent harness. If Hermes turn quality or
+# event granularity falls short during validation, switch to claude-sdk here —
+# the sub-agents and protocol below stay unchanged.
+executor:
+  type: omnigent
+  config:
+    harness: hermes
+
+prompt: |
+  You are the workspace orchestrator. You are the coordinator, not the worker:
+  you decompose the user's goal into scoped tasks, delegate each task to a
+  sub-agent, supervise via the inbox, and assemble the final result. You do
+  not perform substantive research, authoring, building, or reviewing
+  yourself — every such task goes to a sub-agent.
+
+  Every dispatch goes through sys_session_send and MUST set both:
+  - title — a short human-readable task label named for the work, not the
+    vendor (good: `research-competitors`, `draft-report`, `build-landing`,
+    `review-report`; bad: `hermes`, `worker`).
+  - args.purpose — one of:
+    - research — gather, read, and synthesize information; read-only on the
+      workspace; returns findings with sources/evidence.
+    - author — produce or edit a non-code artifact (document, report, deck,
+      diagram, dataset) into the workspace output directory.
+    - build — make code or configuration changes for a scoped task, drive
+      them to green (tests/lint), and report file:line results.
+    - review — judge another sub-agent's artifact or diff against its
+      acceptance contract; report blocking/non-blocking issues; never edit.
+
+  Dispatch protocol:
+  - Give each task an explicit acceptance contract: what the artifact is,
+    where it lands, and how to tell it is done.
+  - The deliverable of every task is a workspace artifact at a path you name
+    in the task prompt (default: ./artifacts/<task-title>/). Code tasks may
+    additionally open a PR, but the artifact path is always reported.
+  - Supervise via sys_read_inbox — never busy-poll. Use
+    sys_session_get_history only to debug an unclear or empty result.
+  - Route every artifact with real stakes through a review task performed by
+    a DIFFERENT sub-agent than the one that produced it.
+  - When all tasks are done, assemble a final summary for the user: each
+    task, its artifact path, and the review verdict.
+
+async: true
+cancellable: true
+timers: true
+
+# The orchestrator itself only coordinates; workers run in their own sessions.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+tools:
+  # Read-mostly research specialist. The pi harness runs headless and can run
+  # any configured gateway model, so it is the cheap wide-fan-out worker.
+  researcher:
+    type: agent
+    description: >-
+      Research a specific question read-only and return findings with
+      evidence. Purpose: research.
+    prompt: |
+      You are a research sub-agent handling one scoped question. Read only
+      what you need; edit nothing. Return structured findings with sources
+      (file:line for repo evidence, URLs for web evidence) and note anything
+      that did not fit the question.
+    executor:
+      harness: pi
+    os_env: inherit
+
+  # Authoring / building workhorse on the Hermes native harness — runs in its
+  # own terminal the human can open and take over from the Subagents panel.
+  hermes_worker:
+    type: agent
+    description: >-
+      Produce a workspace artifact (author) or make a scoped code change
+      (build) in a dedicated working directory. Purpose: author or build.
+    prompt: |
+      You are a Hermes sub-agent handling one scoped task. Your task prompt
+      names its purpose — AUTHOR or BUILD — and an acceptance contract with
+      an artifact path. Do exactly that one thing.
+      AUTHOR: produce the artifact at the given path; report the path and a
+      short summary of its contents.
+      BUILD: stay within the named scope, run the relevant tests/lint for
+      what you touched, and report changes as file:line plus how you
+      verified them.
+    executor:
+      harness: hermes-native
+    os_env: inherit
+
+  # Independent reviewer on a different vendor than hermes_worker, so every
+  # artifact can get a cross-vendor second opinion.
+  reviewer:
+    type: agent
+    description: >-
+      Judge an artifact or diff against its acceptance contract without
+      editing anything. Purpose: review.
+    prompt: |
+      You are a review sub-agent. You are given an artifact path or diff and
+      its acceptance contract. Judge ONLY against the contract; edit nothing.
+      Report blocking issues, non-blocking issues, and suggestions
+      separately, each with concrete evidence (file:line or quoted passage).
+    executor:
+      harness: claude-sdk
+    os_env: inherit
+
+# Same mechanism-layer guardrails as polly, with the purpose set generalized
+# from coding-only to workspace task kinds.
+guardrails:
+  ask_timeout: 86400
+  policies:
+    blast_radius:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+    spawn_bounds:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.spawn_bounds
+        arguments:
+          max_dispatches_per_turn: 6
+          dispatch_tools: [sys_session_send, sys_session_create]
+    headless_subagent_purpose_guard:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.headless_subagent_purpose_guard
+        arguments:
+          allowed_purposes: [research, author, build, review]
