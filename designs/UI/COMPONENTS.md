@@ -3,7 +3,7 @@
 Every component in `web/src`, grouped the way the directories are. Test files
 are omitted; each component has a co-located `*.test.tsx` unless noted.
 
-## 1. Primitives — `components/ui/` (29 files)
+## 1. Primitives — `components/ui/` (26 files)
 
 shadcn-style wrappers over `radix-ui`, styled with `class-variance-authority`
 and merged through `cn()` (`clsx` + `tailwind-merge`). Every primitive stamps a
